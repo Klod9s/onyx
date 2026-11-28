@@ -90,3 +90,6 @@ local.properties
 /captures/
 # Release build artifacts (including R8 mapping files)
 app/release/
+
+# Release output copied to the repo root (APK + R8 mapping must never be committed)
+/release/
