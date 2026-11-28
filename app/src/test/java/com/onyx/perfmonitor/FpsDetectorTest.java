@@ -228,4 +228,104 @@ public class FpsDetectorTest {
         assertEquals(60.0, recovered.fps, 0.05);
         assertEquals("SF Counter", recovered.source);
     }
+
+    @Test
+    public void reportsFpsFromBlastLatency() {
+        // Above LOOKUP_RETRY_MS (5 s) so the first BLAST probe is not gated off.
+        AtomicLong clock = new AtomicLong(10_000_000_000L);
+        AtomicLong snapshotCalls = new AtomicLong();
+        FpsDetector detector = detectorAt(clock);
+
+        FpsDetector.Shell shell = new FpsDetector.Shell() {
+            @Override public String surfaceFlingerDump() { return ""; }
+            @Override public String surfaceFlingerLayers() { return ""; }
+            @Override public String surfaceFlingerLatency(String layerName) { return ""; }
+            @Override public String surfaceFlingerTimeStatsDump() { return ""; }
+            @Override public String surfaceFlingerLayerLatencySnapshot(
+                    String packageName, boolean blastOnly) {
+                assertTrue("BLAST is probed first", blastOnly);
+                snapshotCalls.incrementAndGet();
+                return "__ONYX_SELECTED_LAYER__\n"
+                        + "BLAST SurfaceView com.example.game/BLAST\n"
+                        + "__ONYX_LATENCY__\n"
+                        + latencyDump(clock, 500_000_000L, 100);
+            }
+        };
+
+        FpsDetector.Result result = detector.detect(shell, "com.example.game");
+
+        assertTrue(result.valid());
+        assertEquals("BLAST SF latency", result.source);
+        assertEquals(10.0, result.frameRefreshPeriodMs, 0.0001);
+        assertTrue("plausible FPS for a 10 ms refresh: " + result.fps,
+                result.fps > 50 && result.fps <= 120);
+        assertEquals(1, snapshotCalls.get());
+    }
+
+    @Test
+    public void fallsBackToSeparateLookupWhenSnapshotIsNull() {
+        AtomicLong clock = new AtomicLong(10_000_000_000L);
+        AtomicLong layerCalls = new AtomicLong();
+        AtomicLong latencyCalls = new AtomicLong();
+        FpsDetector detector = detectorAt(clock);
+
+        // No snapshot override: the interface default returns null, which is also
+        // what a malformed reply or a RemoteException produces. The detector must
+        // still find the layer through the separate two-command lookup.
+        FpsDetector.Shell shell = new FpsDetector.Shell() {
+            @Override public String surfaceFlingerDump() { return ""; }
+            @Override public String surfaceFlingerLayers() {
+                layerCalls.incrementAndGet();
+                return "BLAST SurfaceView com.example.game\n";
+            }
+            @Override public String surfaceFlingerLatency(String layerName) {
+                latencyCalls.incrementAndGet();
+                return latencyDump(clock, 500_000_000L, 100);
+            }
+            @Override public String surfaceFlingerTimeStatsDump() { return ""; }
+        };
+
+        FpsDetector.Result result = detector.detect(shell, "com.example.game");
+
+        assertTrue("FPS must be found through the separate lookup", result.valid());
+        assertEquals("BLAST SF latency", result.source);
+        assertTrue("layer list was queried", layerCalls.get() >= 1);
+        assertTrue("latency was read separately", latencyCalls.get() >= 1);
+    }
+
+    @Test
+    public void fallsBackToSeparateLookupWhenSnapshotLatencyIsEmpty() {
+        AtomicLong clock = new AtomicLong(10_000_000_000L);
+        AtomicLong layerCalls = new AtomicLong();
+        AtomicLong latencyCalls = new AtomicLong();
+        FpsDetector detector = detectorAt(clock);
+
+        FpsDetector.Shell shell = new FpsDetector.Shell() {
+            @Override public String surfaceFlingerDump() { return ""; }
+            @Override public String surfaceFlingerLayers() {
+                layerCalls.incrementAndGet();
+                return "BLAST SurfaceView com.example.game\n";
+            }
+            @Override public String surfaceFlingerLatency(String layerName) {
+                latencyCalls.incrementAndGet();
+                return latencyDump(clock, 500_000_000L, 100);
+            }
+            @Override public String surfaceFlingerTimeStatsDump() { return ""; }
+            @Override public String surfaceFlingerLayerLatencySnapshot(
+                    String packageName, boolean blastOnly) {
+                // Markers present but both sections empty: readLayerLatencySnapshot
+                // returns null, so the fallback must run.
+                return "__ONYX_SELECTED_LAYER__\n__ONYX_LATENCY__\n";
+            }
+        };
+
+        FpsDetector.Result result = detector.detect(shell, "com.example.game");
+
+        assertTrue(result.valid());
+        assertEquals("BLAST SF latency", result.source);
+        assertEquals(1, layerCalls.get());
+        assertEquals(1, latencyCalls.get());
+    }
+
+
 }
