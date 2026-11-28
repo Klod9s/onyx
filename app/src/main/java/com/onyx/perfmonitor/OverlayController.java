@@ -35,16 +35,22 @@ final class OverlayController {
         this.activity = activity;
     }
 
-    void handoffSampling() {
+    void handoffSampling(boolean reattachWindow) {
         if (!getPrefs().getBoolean("overlay_enabled", false)) return;
         getPrefs().edit().putBoolean("overlay_engine_active", true).apply();
 
         Intent intent = new Intent(activity, FloatingFpsService.class);
         intent.setAction(FloatingFpsService.ACTION_ENGINE_HANDOFF);
+        intent.putExtra(FloatingFpsService.EXTRA_REATTACH, reattachWindow);
         try {
             activity.startService(intent);
         } catch (Exception ignored) {
         }
+    }
+
+    /** Asks the service to re-add the overlay window above the new foreground app. */
+    void requestReattach() {
+        handoffSampling(true);
     }
 
     void stopSampling() {

@@ -54,6 +54,9 @@ public class FloatingFpsService extends Service {
             "com.onyx.perfmonitor.ENGINE_HANDOFF";
     public static final String ACTION_ENGINE_STOP =
             "com.onyx.perfmonitor.ENGINE_STOP";
+    /** Boolean extra on ACTION_ENGINE_HANDOFF: also re-add the overlay window. */
+    public static final String EXTRA_REATTACH = "reattach";
+    private long lastReattachRequestMs = 0;
 
     private static final String CHANNEL = "fps_overlay";
     private static final int NOTIFICATION_ID = 71;
@@ -1113,14 +1116,19 @@ public class FloatingFpsService extends Service {
         }
 
         try {
+            // The refresh loop survives a re-add on its own; only restart it
+            // when it had stopped, or each re-add stacks another loop.
+            boolean refreshLoopStopped = !attached;
             if (attached) {
                 windowManager.removeViewImmediate(overlayRoot);
                 attached = false;
             }
             windowManager.addView(overlayRoot, overlayParams);
             attached = true;
-            handler.removeCallbacks(updater);
-            handler.post(updater);
+            if (refreshLoopStopped) {
+                handler.removeCallbacks(updater);
+                handler.post(updater);
+            }
         } catch (Exception e) {
             // Keep the service alive; a later foreground handoff can retry.
             android.util.Log.w("FloatingFpsService",
@@ -1529,10 +1537,19 @@ public class FloatingFpsService extends Service {
                 "overlay_enabled", false))) {
             startBackgroundSampling();
             // A fullscreen game may take the foreground while the existing
-            // application-overlay window is still below its surface. Re-add
-            // the same window after the Activity has completed its handoff.
-            handler.removeCallbacks(reattachOverlayRunnable);
-            handler.postDelayed(reattachOverlayRunnable, 350);
+            // application-overlay window is still below its surface, so the
+            // Activity asks for the window to be re-added once it has really
+            // left the screen. Re-adding makes the overlay blink, so a plain
+            // sampling handoff (dialogs, shade, permission prompts) never
+            // does it, and requests are rate-limited.
+            boolean wantsReattach = intent == null
+                    || intent.getBooleanExtra(EXTRA_REATTACH, false);
+            long nowMs = android.os.SystemClock.elapsedRealtime();
+            if (wantsReattach && nowMs - lastReattachRequestMs > 3000) {
+                lastReattachRequestMs = nowMs;
+                handler.removeCallbacks(reattachOverlayRunnable);
+                handler.postDelayed(reattachOverlayRunnable, 350);
+            }
         } else if (ACTION_ENGINE_STOP.equals(action)) {
             stopBackgroundSampling();
         } else if (ACTION_TOGGLE.equals(action)) {

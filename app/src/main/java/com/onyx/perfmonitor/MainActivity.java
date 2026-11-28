@@ -250,11 +250,21 @@ public class MainActivity extends Activity {
     private final OverlayController overlayController =
             new OverlayController(this);
 
+    // Set once the service has been told to take over sampling, so leaving the
+    // app (onPause then onDestroy) does not send the handoff twice.
+    private boolean overlayHandedOff = false;
+
     private void handoffOverlaySampling() {
-        overlayController.handoffSampling();
+        handoffOverlaySampling(false);
+    }
+
+    private void handoffOverlaySampling(boolean reattachWindow) {
+        overlayHandedOff = true;
+        overlayController.handoffSampling(reattachWindow);
     }
 
     private void stopOverlaySampling() {
+        overlayHandedOff = false;
         overlayController.stopSampling();
     }
 
@@ -727,6 +737,11 @@ new MonitorPageBuilder(this).build(page);
         return getSharedPreferences(PREFS, MODE_PRIVATE);
     }
 
+    /** True while the floating overlay is switched on and needs live readings. */
+    boolean isOverlayEnabled() {
+        return getPrefs().getBoolean("overlay_enabled", false);
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
@@ -757,6 +772,9 @@ new MonitorPageBuilder(this).build(page);
     @Override
     protected void onStop() {
         super.onStop();
+        // The Activity has really left the screen (not just a dialog or the
+        // notification shade), so refresh the overlay window's z-order once.
+        if (overlayHandedOff) overlayController.requestReattach();
         if (brand != null) {
             brand.stopShine();
         }
@@ -1355,7 +1373,7 @@ new MonitorPageBuilder(this).build(page);
 
         running = false;
         samplingController.stop();
-        handoffOverlaySampling();
+        if (!overlayHandedOff) handoffOverlaySampling(true);
         worker.shutdownNow();
         // Drain queued session saves/deletes/exports instead of cancelling file work.
         fileWorker.shutdown();

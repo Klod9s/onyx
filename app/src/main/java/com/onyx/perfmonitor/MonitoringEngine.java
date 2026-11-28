@@ -29,8 +29,34 @@ final class MonitoringEngine {
     private volatile long frameCaptureStartNs = Long.MAX_VALUE;
     private long startElapsedMs = android.os.SystemClock.elapsedRealtime();
     private final CpuUsageTracker cpuUsageTracker = new CpuUsageTracker();
-    private String cachedForegroundPackage = "";
-    private long lastForegroundCheckMs = 0;
+    private volatile String cachedForegroundPackage = "";
+    private volatile long lastForegroundCheckMs = 0;
+    // Root-only: GPU sysfs discovery (devfreq scan) is throttled while nothing has
+    // ever been found, instead of forking a shell per devfreq node every sample.
+    private long lastGpuScanMs = 0;
+    private volatile long rootFgRefreshMs = 1500;
+    private volatile long shizukuFgRefreshMs = 1500;
+    private static final java.util.regex.Pattern COMPONENT_PATTERN =
+            java.util.regex.Pattern.compile(
+                    "([A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+)/[A-Za-z0-9_.$]+");
+    // Root helper (app_process running ShizukuShellService's reader as uid 0).
+    private volatile boolean rootHelperReady = false;
+    private volatile RootShell rootHelperShell;
+    private volatile long rootHelperRetryAtMs = 0;
+    private volatile int rootHelperFailures = 0;
+    private final java.util.concurrent.atomic.AtomicBoolean rootHelperStarting =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private boolean gpuLoadEverFound = false;
+    // Root-only timing, logged as a rolling average (tag OnyxRootPerf).
+    private int perfCount = 0;
+    private long perfFgMs = 0;
+    private long perfMetricsMs = 0;
+    private long perfTotalMs = 0;
+    // Shizuku-only timing, logged as a rolling average (tag OnyxShizukuPerf).
+    private int szPerfCount = 0;
+    private long szPerfMetricsMs = 0;
+    private long szPerfFgMs = 0;
+    private long szPerfTotalMs = 0;
     private String cachedGpuFreqPath = "";
     private String cachedGpuLoadPath = "";
     private String cachedMaliPath = "";
@@ -104,7 +130,7 @@ final class MonitoringEngine {
         fpsDetector.reset();
     }
 
-    // ---- Fast FPS loop (Shizuku) ----
+    // ---- Fast FPS loop (Shizuku and root) ----
     private volatile FpsDetector.Result latestFps = null;
     private volatile long latestFpsAtMs = 0;
     private volatile String fpsPackage = "";
@@ -129,12 +155,29 @@ final class MonitoringEngine {
                         return;
                     }
 
+                    String loopMode = lastSamplingMode;
+                    if ("ROOT".equals(loopMode)) {
+                        // Foreground lookup (dumpsys window) also runs here, off the
+                        // sampling thread, on this loop's own su shell.
+                        refreshForegroundRootIfDue(fpsRootShell);
+                    } else if ("SHIZUKU".equals(loopMode)) {
+                        // Same off-thread refresh for Shizuku: the dumpsys round
+                        // trip costs ~46 ms and belongs here, not in sample().
+                        IOnyxUserService svc = shizukuService;
+                        if (svc != null) refreshForegroundShizukuIfDue(svc);
+                    }
                     String pkg = fpsPackage;
-                    IOnyxUserService svc = shizukuService;
-                    if (svc != null && !pkg.isEmpty()
-                            && "SHIZUKU".equals(lastSamplingMode)) {
-                        FpsDetector.Result r =
-                                fpsDetector.detect(shizukuFpsShell(svc), pkg);
+                    FpsDetector.Shell loopShell = null;
+                    if (!pkg.isEmpty()) {
+                        if ("SHIZUKU".equals(loopMode)) {
+                            IOnyxUserService svc = shizukuService;
+                            if (svc != null) loopShell = shizukuFpsShell(svc);
+                        } else if ("ROOT".equals(loopMode)) {
+                            loopShell = rootFpsShell(fpsRootShell);
+                        }
+                    }
+                    if (loopShell != null) {
+                        FpsDetector.Result r = fpsDetector.detect(loopShell, pkg);
                         long now = android.os.SystemClock.elapsedRealtime();
                         if (r.valid()) {
                             if (!r.frameIntervalsMs.isEmpty()) {
@@ -207,42 +250,40 @@ final class MonitoringEngine {
         // calculate across a transition between ROOT, SHIZUKU, and ANDROID.
         if (!mode.equals(lastSamplingMode)) {
             resetBaselines();
+            if ("ROOT".equals(mode) || "ROOT".equals(lastSamplingMode)) {
+                // Drop FPS results produced under the other source.
+                latestFps = null;
+                synchronized (pendingIntervals) {
+                    pendingIntervals.clear();
+                }
+            }
             lastSamplingMode = mode;
         }
 
         Sample sample;
-        long readStartMs = android.os.SystemClock.elapsedRealtime();
 
         if ("ROOT".equals(mode)) {
-            sample = readSample(recording);
+            sample = null;
+            if (rootHelperReady) {
+                sample = readRootHelperSample(recording);
+            } else {
+                maybeStartRootHelper();
+            }
+            // Helper not up yet (or it failed): the shell-script reader still works.
+            if (sample == null) sample = readSample(recording);
         } else if ("SHIZUKU".equals(mode)) {
             sample = readShizukuSample(recording);
         } else {
             sample = readAndroidSample(recording);
         }
 
-        long readDurationMs =
-                android.os.SystemClock.elapsedRealtime() - readStartMs;
-
-        long thermalStartMs = android.os.SystemClock.elapsedRealtime();
         if (sample != null) {
             sample.thermalStatus = ThermalStatusReader.read(context);
         }
-        long thermalDurationMs =
-                android.os.SystemClock.elapsedRealtime() - thermalStartMs;
 
-        long ramStartMs = android.os.SystemClock.elapsedRealtime();
         if (sample != null) {
             sample.ramUsagePercent = readRamUsagePercent();
         }
-        long ramDurationMs =
-                android.os.SystemClock.elapsedRealtime() - ramStartMs;
-
-        android.util.Log.d("ONYX_STAGES",
-                "mode=" + mode
-                        + " read=" + readDurationMs + "ms"
-                        + " thermal=" + thermalDurationMs + "ms"
-                        + " ram=" + ramDurationMs + "ms");
 
         return sample;
     }
@@ -270,28 +311,38 @@ final class MonitoringEngine {
 
 
     private String readMetricsShellRoot() {
+        long scanNow = android.os.SystemClock.elapsedRealtime();
+        // Full devfreq discovery forks several processes per node. Once a GPU
+        // path has been found it is cached, so only keep scanning every sample
+        // if something was found before; otherwise retry every 30 s.
+        boolean scanGpu = gpuLoadEverFound || !cachedGpuFreqPath.isEmpty()
+                || lastGpuScanMs == 0 || scanNow - lastGpuScanMs >= 30_000;
+        if (scanGpu) lastGpuScanMs = scanNow;
+        String scanGpuTest = scanGpu ? "[ 1 = 1 ]" : "[ 1 = 0 ]";
+
         String script =
-                "echo __TEMP__; cat /sys/class/power_supply/battery/temp 2>/dev/null; " +
+                "rd() { R=; [ -r \"$1\" ] && { IFS= read -r R < \"$1\"; } 2>/dev/null; }; " +
+                        "echo __TEMP__; rd /sys/class/power_supply/battery/temp; echo \"$R\"; " +
                         "echo __BAT__; " +
                         "for P in /sys/class/power_supply/*; do " +
                         " [ -d \"$P\" ] || continue; " +
                         " TYPE=; IFS= read -r TYPE < \"$P/type\" 2>/dev/null; " +
                         " [ \"$TYPE\" = \"Battery\" ] || continue; " +
                         " CURRENT=-; VOLTAGE=-; CAPACITY=-; " +
-                        " [ -r \"$P/current_now\" ] && CURRENT=$(cat \"$P/current_now\"); " +
-                        " [ -r \"$P/voltage_now\" ] && VOLTAGE=$(cat \"$P/voltage_now\"); " +
-                        " [ -r \"$P/capacity\" ] && CAPACITY=$(cat \"$P/capacity\"); " +
+                        " rd \"$P/current_now\"; [ -n \"$R\" ] && CURRENT=$R; " +
+                        " rd \"$P/voltage_now\"; [ -n \"$R\" ] && VOLTAGE=$R; " +
+                        " rd \"$P/capacity\"; [ -n \"$R\" ] && CAPACITY=$R; " +
                         " echo \"$CURRENT $VOLTAGE $CAPACITY\"; break; " +
                         "done; " +
                         "echo __CPU__; cat /proc/stat; " +
                         "echo __CPU_FREQ__; " +
                         "for i in 0 1 2 3 4 5 6 7; do " +
                         "F=/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq; V=; " +
-                        "[ -r \"$F\" ] && V=$(cat \"$F\" 2>/dev/null); " +
+                        "rd \"$F\"; V=$R; " +
                         "case \"$V\" in \"\"|*[!0-9]*) V=;; esac; " +
                         "if [ -z \"$V\" ] || [ \"$V\" -le 0 ] 2>/dev/null; then " +
                         " F=/sys/devices/system/cpu/cpu$i/cpufreq/cpuinfo_cur_freq; V=; " +
-                        " [ -r \"$F\" ] && V=$(cat \"$F\" 2>/dev/null); " +
+                        " rd \"$F\"; V=$R; " +
                         " case \"$V\" in \"\"|*[!0-9]*) V=;; esac; " +
                         "fi; " +
                         "if [ -n \"$V\" ] && [ \"$V\" -gt 0 ] 2>/dev/null; then echo \"$V\"; else echo -1; fi; " +
@@ -305,20 +356,20 @@ final class MonitoringEngine {
                         "if [ -z \"$MALI_PATH\" ] && { " + (!maliSearchCompleted ? "[ 1 = 1 ]" : "[ 1 = 0 ]") + " || [ \"$MALI_RETRY\" = 1 ]; }; then " +
                         " if [ -d /sys/class/misc/mali0/device ]; then MALI_PATH='/sys/class/misc/mali0/device'; " +
                         " else MALI_PATH=$(find /sys/devices/platform -name '*.mali' -type d 2>/dev/null | head -n 1); fi; fi; " +
-                        "if [ -r /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq ]; then GPU_FREQ=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq); FOUND_FREQ='/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq'; " +
-                        "elif [ -n \"$CACHED_FREQ\" ] && [ -r \"$CACHED_FREQ\" ]; then GPU_FREQ=$(cat \"$CACHED_FREQ\"); FOUND_FREQ=\"$CACHED_FREQ\"; " +
+                        "if [ -r /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq ]; then rd /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq; GPU_FREQ=$R; FOUND_FREQ='/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq'; " +
+                        "elif [ -n \"$CACHED_FREQ\" ] && [ -r \"$CACHED_FREQ\" ]; then rd \"$CACHED_FREQ\"; GPU_FREQ=$R; FOUND_FREQ=\"$CACHED_FREQ\"; " +
                         "elif [ -n \"$MALI_PATH\" ]; then " +
                         " for F in \"$MALI_PATH\"/devfreq/cur_freq \"$MALI_PATH\"/devfreq/*/cur_freq; do " +
-                        "  if [ -r \"$F\" ]; then GPU_FREQ=$(cat \"$F\"); FOUND_FREQ=\"$F\"; break; fi; done; " +
-                        " if [ \"$FOUND_FREQ\" = 'none' ] && [ -r \"$MALI_PATH/device/clock\" ]; then GPU_FREQ=$(cat \"$MALI_PATH/device/clock\"); FOUND_FREQ=\"$MALI_PATH/device/clock\"; " +
-                        " elif [ \"$FOUND_FREQ\" = 'none' ] && [ -r \"$MALI_PATH/clock\" ]; then GPU_FREQ=$(cat \"$MALI_PATH/clock\"); FOUND_FREQ=\"$MALI_PATH/clock\"; fi; fi; " +
-                        "if [ \"$FOUND_FREQ\" = 'none' ]; then " +
+                        "  if [ -r \"$F\" ]; then rd \"$F\"; GPU_FREQ=$R; FOUND_FREQ=\"$F\"; break; fi; done; " +
+                        " if [ \"$FOUND_FREQ\" = 'none' ] && [ -r \"$MALI_PATH/device/clock\" ]; then rd \"$MALI_PATH/device/clock\"; GPU_FREQ=$R; FOUND_FREQ=\"$MALI_PATH/device/clock\"; " +
+                        " elif [ \"$FOUND_FREQ\" = 'none' ] && [ -r \"$MALI_PATH/clock\" ]; then rd \"$MALI_PATH/clock\"; GPU_FREQ=$R; FOUND_FREQ=\"$MALI_PATH/clock\"; fi; fi; " +
+                        "if [ \"$FOUND_FREQ\" = 'none' ] && " + scanGpuTest + "; then " +
                         " for D in /sys/class/devfreq/*; do " +
                         "  [ -d \"$D\" ] || continue; N=${D##*/}; " +
                         "  if [ -r \"$D/name\" ]; then IFS= read -r N < \"$D/name\"; fi; " +
                         "  N=$(printf '%s' \"$N\" | tr '[:upper:]' '[:lower:]'); " +
                         "  case \"$N\" in " + GpuDevfreqMatcher.shellCasePatterns() + ") ;; *) continue;; esac; " +
-                        "  if [ -r \"$D/cur_freq\" ]; then GPU_FREQ=$(cat \"$D/cur_freq\"); FOUND_FREQ=\"$D/cur_freq\"; break; fi; done; fi; " +
+                        "  if [ -r \"$D/cur_freq\" ]; then rd \"$D/cur_freq\"; GPU_FREQ=$R; FOUND_FREQ=\"$D/cur_freq\"; break; fi; done; fi; " +
                         "if [ \"$FOUND_FREQ\" = 'none' ] && " + (!maliSearchCompleted ? "[ 1 = 1 ]" : "[ 1 = 0 ]") + "; then " +
                         " for F in $(find /sys/devices -type f \\( -path '*/devfreq/cur_freq' -o -path '*/devfreq/*/cur_freq' \\) -print 2>/dev/null); do " +
                         "  [ -r \"$F\" ] || continue; D=${F%/cur_freq}; N=${D##*/}; " +
@@ -327,10 +378,10 @@ final class MonitoringEngine {
                         "  N=$(printf '%s' \"$N\" | tr '[:upper:]' '[:lower:]'); " +
                         "  case \"$N\" in *busmon*) continue;; esac; " +
                         "  case \"$N\" in " + GpuDevfreqMatcher.shellCasePatterns() + ") ;; *) continue;; esac; " +
-                        "  GPU_FREQ=$(cat \"$F\" 2>/dev/null); FOUND_FREQ=\"$F\"; break; done; fi; " +
+                        "  rd \"$F\"; GPU_FREQ=$R; FOUND_FREQ=\"$F\"; break; done; fi; " +
                         "echo __GPU_FREQ_BLOCK__; echo $GPU_FREQ; echo $FOUND_FREQ; " +
                         "GPU_LOAD_CANDIDATES=''; " +
-                        "add_gpu_load_candidate() { F=\"$1\"; [ -r \"$F\" ] || return; V=$(cat \"$F\" 2>/dev/null) || return; [ -n \"$V\" ] || return; " +
+                        "add_gpu_load_candidate() { F=\"$1\"; [ -r \"$F\" ] || return; rd \"$F\"; V=$R; [ -n \"$V\" ] || return; " +
                         " if [ -n \"$GPU_LOAD_CANDIDATES\" ]; then GPU_LOAD_CANDIDATES=\"${GPU_LOAD_CANDIDATES}\n\"; fi; " +
                         " GPU_LOAD_CANDIDATES=\"${GPU_LOAD_CANDIDATES}${V} ${F}\"; }; " +
                         "add_gpu_load_candidate /sys/class/kgsl/kgsl-3d0/gpubusy; " +
@@ -339,7 +390,7 @@ final class MonitoringEngine {
                         "if [ -n \"$MALI_PATH\" ]; then " +
                         " for F in \"$MALI_PATH\"/devfreq/load \"$MALI_PATH\"/devfreq/*/load \"$MALI_PATH\"/devfreq/utilisation \"$MALI_PATH\"/devfreq/*/utilisation \"$MALI_PATH\"/devfreq/utilization \"$MALI_PATH\"/devfreq/*/utilization \"$MALI_PATH\"/device/utilisation \"$MALI_PATH\"/device/utilization; do " +
                         "  add_gpu_load_candidate \"$F\"; done; fi; " +
-                        "if [ -z \"$CACHED_LOAD\" ]; then for D in /sys/class/devfreq/*; do " +
+                        "if [ -z \"$CACHED_LOAD\" ] && " + scanGpuTest + "; then for D in /sys/class/devfreq/*; do " +
                         " [ -d \"$D\" ] || continue; N=${D##*/}; " +
                         " if [ -r \"$D/name\" ]; then IFS= read -r N < \"$D/name\"; fi; " +
                         " N=$(printf '%s' \"$N\" | tr '[:upper:]' '[:lower:]'); " +
@@ -381,10 +432,108 @@ final class MonitoringEngine {
         return rootCommand(script);
     }
 
+    /** Zero-fork metrics: the root helper reads sysfs in-process. Null = use the script. */
+    private Sample readRootHelperSample(boolean recording) {
+        long tStart = android.os.SystemClock.elapsedRealtime();
+        rootFgRefreshMs = recording ? 1000 : 1500;
+        String app = getForegroundAppRoot();
+        long tFg = android.os.SystemClock.elapsedRealtime();
+
+        Sample sample = readAndroidSample(recording);
+        if (sample == null) return null;
+
+        RootShell helper = rootHelperShell;
+        String freqOutput = helper == null ? null : helper.exec(
+                "M\t" + cachedGpuFreqPath + "\t" + cachedGpuLoadPath + "\t"
+                        + cachedMaliPath + "\t" + (maliSearchCompleted ? "0" : "1"));
+        if (freqOutput == null || !freqOutput.contains("__END__")) {
+            rootHelperFailed("no/short reply");
+            return null;
+        }
+        long tMetrics = android.os.SystemClock.elapsedRealtime();
+
+        try {
+            java.util.Arrays.fill(sample.cpu, -1);
+            java.util.Arrays.fill(sample.cpuFreqMHz, -1);
+            sample.gpuFreqMHz = -1;
+            sample.gpuLoadPercent = -1;
+            applySysfsMetrics(freqOutput, sample);
+        } catch (Exception e) {
+            rootHelperFailed("parse error");
+            return null;
+        }
+
+        sample.app = (app == null || app.isEmpty()) ? "Unknown" : app;
+        applyCachedRootFps(sample);
+        recordRootPerf(tStart, tFg, tMetrics, true);
+        return sample;
+    }
+
+    private void maybeStartRootHelper() {
+        if (rootHelperReady || rootHelperFailures >= 3) return;
+        if (android.os.SystemClock.elapsedRealtime() < rootHelperRetryAtMs) return;
+        if (!rootHelperStarting.compareAndSet(false, true)) return;
+
+        final String apk = context.getPackageCodePath();
+        if (apk == null || !apk.matches("[A-Za-z0-9_./=~+-]+")) {
+            rootHelperFailures = 3;
+            rootHelperStarting.set(false);
+            return;
+        }
+
+        Thread starter = new Thread(() -> {
+            try {
+                RootShell old = rootHelperShell;
+                if (old != null) old.close();
+                RootShell h = new RootShell("OnyxRootHelperReader",
+                        new String[]{"su", "-c", "CLASSPATH='" + apk
+                                + "' exec app_process /system/bin"
+                                + " --nice-name=onyx_root_helper "
+                                + RootMetricsHelper.class.getName()},
+                        4_000);
+                rootHelperShell = h;
+                String pong = h.exec("PING");
+                if (pong != null && pong.contains("OK")) {
+                    rootHelperFailures = 0;
+                    rootHelperReady = true;
+                    android.util.Log.d("OnyxRootHelper", "root helper ready");
+                } else {
+                    rootHelperFailed("no PING reply");
+                }
+            } catch (Throwable t) {
+                rootHelperFailed("start: " + t);
+            } finally {
+                rootHelperStarting.set(false);
+            }
+        }, "OnyxRootHelperStart");
+        starter.setDaemon(true);
+        starter.start();
+    }
+
+    private void rootHelperFailed(String why) {
+        rootHelperReady = false;
+        rootHelperFailures++;
+        rootHelperRetryAtMs = android.os.SystemClock.elapsedRealtime() + 60_000;
+        android.util.Log.w("OnyxRootHelper", "helper unavailable (" + why
+                + "), attempt " + rootHelperFailures + "; using shell reader");
+        RootShell h = rootHelperShell;
+        if (h != null) h.close();
+    }
+
+    private void closeRootHelper() {
+        rootHelperReady = false;
+        RootShell h = rootHelperShell;
+        if (h != null) h.close();
+    }
+
     private Sample readSample(boolean recording) {
+        long tStart = android.os.SystemClock.elapsedRealtime();
+        rootFgRefreshMs = recording ? 1000 : 1500;
         String app = getForegroundAppRoot();
         if (app == null) app = "Unknown";
+        long tFg = android.os.SystemClock.elapsedRealtime();
         String output = readMetricsShellRoot();
+        long tMetrics = android.os.SystemClock.elapsedRealtime();
         if (output == null) return null;
 
         try {
@@ -401,26 +550,7 @@ final class MonitoringEngine {
             sample.timeMs = Math.max(0, android.os.SystemClock.elapsedRealtime() - startElapsedMs);
             sample.app = app.isEmpty() ? "Unknown" : app;
 
-            long fpsStartMs = android.os.SystemClock.elapsedRealtime();
-            FpsDetector.Result r = fpsDetector.detect(rootFpsShell(), sample.app);
-            android.util.Log.d("ONYX_FPS",
-                    "mode=ROOT duration=" + (android.os.SystemClock.elapsedRealtime() - fpsStartMs) + "ms, source=" + r.source);
-
-            if (r.valid()) {
-                sample.fps = r.fps;
-                sample.fpsSource = r.source;
-                sample.averageFrameTimeMs = r.averageFrameTimeMs;
-                sample.frameTimeStdDevMs = r.frameTimeStdDevMs;
-                sample.stutterCount = r.stutterCount;
-                sample.frameRefreshPeriodMs = r.frameRefreshPeriodMs;
-                sample.frameIntervalsMs.addAll(r.frameIntervalsMs);
-            } else {
-                sample.fps = -1;
-                sample.fpsSource = "none";
-                sample.averageFrameTimeMs = -1;
-                sample.frameTimeStdDevMs = -1;
-                sample.stutterCount = -1;
-            }
+            applyCachedRootFps(sample);
 
             try {
                 double rawTemp = Double.parseDouble(tempRaw.trim());
@@ -496,6 +626,7 @@ final class MonitoringEngine {
                 if (!validatedPath.isEmpty()) {
                     sample.gpuLoadPercent = parseGpuLoadPercent(selectedGpuLoad);
                     cachedGpuLoadPath = validatedPath;
+                    gpuLoadEverFound = true;
                 }
             }
 
@@ -508,13 +639,95 @@ final class MonitoringEngine {
             }
 
             maliSearchCompleted = true;
+            recordRootPerf(tStart, tFg, tMetrics, false);
             return sample;
         } catch (Exception e) {
             return null;
         }
     }
 
+    /**
+     * Parses the marker-delimited reply of the in-process (Java) metrics reader
+     * into {@code sample}. Shared by the Shizuku path and the root helper path.
+     */
+    private void applySysfsMetrics(String freqOutput, Sample sample) {
+        String batteryBlock = between(
+                freqOutput, "__BATTERY_BLOCK__\n", "__PROC_STAT__"
+        ).trim();
+        if (!batteryBlock.isEmpty()) {
+            SysfsBatteryValues batteryValues =
+                    parseSysfsBatteryValues(batteryBlock);
+            if (batteryValues.hasCurrent()
+                    && (batteryValues.currentMicroamps != 0 || sample.currentMa < 0)) {
+                sample.currentMa = batteryCurrent.toMilliampsFromSysfs(
+                        batteryValues.currentMicroamps, sample.batteryUnplugged);
+            }
+            if (batteryValues.hasVoltage()) {
+                sample.voltage = batteryValues.voltageMicrovolts / 1000000.0;
+            }
+            if (batteryValues.batteryPercent >= 0) {
+                sample.battery = batteryValues.batteryPercent;
+            }
+            sample.power = calculatePowerWatts(
+                    sample.currentMa, sample.voltage,
+                    sample.currentMa != -1 && sample.voltage > 0);
+        }
+
+        String cpuOutput = between(
+                freqOutput, "__PROC_STAT__\n", "__CPU_FREQ__"
+        ).trim();
+        if (!cpuOutput.isEmpty()) {
+            sample.cpu = parseCpu(cpuOutput);
+        }
+
+        String cpuFreqRaw = between(freqOutput, "__CPU_FREQ__\n", "__GPU_FREQ_BLOCK__").trim();
+        parseCpuFrequencies(cpuFreqRaw, sample.cpuFreqMHz);
+
+        String gpuFreqBlock = between(
+                freqOutput, "__GPU_FREQ_BLOCK__\n", "__GPU_LOAD_BLOCK__"
+        ).trim();
+        String[] gpuFreqParts = gpuFreqBlock.split("\\s+");
+        String gpuFreqPath = gpuFreqParts.length >= 2
+                ? gpuFreqParts[1] : "";
+        sample.gpuFreqMHz = parseGpuFrequencyMHz(
+                gpuFreqBlock, gpuFreqPath);
+        if (!gpuFreqPath.equals("none") && !gpuFreqPath.isEmpty()) {
+            cachedGpuFreqPath = validateSysfsPath(gpuFreqPath);
+        }
+
+        String gpuLoadBlock = between(
+                freqOutput, "__GPU_LOAD_BLOCK__\n", "__THERMAL_BLOCK__").trim();
+        String selectedGpuLoad = firstValidGpuLoadCandidate(gpuLoadBlock);
+
+        sample.gpuLoadPercent = -1;
+        cachedGpuLoadPath = "";
+
+        if (!selectedGpuLoad.isEmpty()) {
+            String[] gpuLoadParts = selectedGpuLoad.split("\\s+");
+            String gpuLoadPath = gpuLoadParts[gpuLoadParts.length - 1];
+            String validatedPath = validateSysfsPath(gpuLoadPath);
+            if (!validatedPath.isEmpty()) {
+                sample.gpuLoadPercent = parseGpuLoadPercent(selectedGpuLoad);
+                cachedGpuLoadPath = validatedPath;
+            }
+        }
+
+        parseThermalTemperatures(
+                between(freqOutput, "__THERMAL_BLOCK__\n", "__COOLING_BLOCK__"), sample);
+        applyCoolingReading(
+                between(freqOutput, "__COOLING_BLOCK__\n", "__MALI_BLOCK__"), sample);
+
+        String maliBlock = between(freqOutput, "__MALI_BLOCK__\n", "__END__").trim();
+        if (!maliBlock.isEmpty()) {
+            cachedMaliPath = maliBlock.equals("none")
+                    ? ""
+                    : validateSysfsPath(maliBlock);
+        }
+        maliSearchCompleted = true;
+    }
+
     private Sample readShizukuSample(boolean recording) {
+        long tStart = android.os.SystemClock.elapsedRealtime();
         Sample sample = readAndroidSample(recording);
         if (sample == null) return null;
 
@@ -541,110 +754,29 @@ final class MonitoringEngine {
                         !maliSearchCompleted);
 
                 if (freqOutput != null) {
-                    String batteryBlock = between(
-                            freqOutput, "__BATTERY_BLOCK__\n", "__PROC_STAT__"
-                    ).trim();
-                    if (!batteryBlock.isEmpty()) {
-                        SysfsBatteryValues batteryValues =
-                                parseSysfsBatteryValues(batteryBlock);
-                        if (batteryValues.hasCurrent()
-                                && (batteryValues.currentMicroamps != 0 || sample.currentMa < 0)) {
-                            sample.currentMa = batteryCurrent.toMilliampsFromSysfs(
-                                    batteryValues.currentMicroamps, sample.batteryUnplugged);
-                        }
-                        if (batteryValues.hasVoltage()) {
-                            sample.voltage = batteryValues.voltageMicrovolts / 1000000.0;
-                        }
-                        if (batteryValues.batteryPercent >= 0) {
-                            sample.battery = batteryValues.batteryPercent;
-                        }
-                        sample.power = calculatePowerWatts(
-                                sample.currentMa, sample.voltage,
-                                sample.currentMa != -1 && sample.voltage > 0);
-                    }
-
-                    String cpuOutput = between(
-                            freqOutput, "__PROC_STAT__\n", "__CPU_FREQ__"
-                    ).trim();
-                    if (!cpuOutput.isEmpty()) {
-                        sample.cpu = parseCpu(cpuOutput);
-                    }
-
-                    String cpuFreqRaw = between(freqOutput, "__CPU_FREQ__\n", "__GPU_FREQ_BLOCK__").trim();
-                    parseCpuFrequencies(cpuFreqRaw, sample.cpuFreqMHz);
-
-                    String gpuFreqBlock = between(
-                            freqOutput, "__GPU_FREQ_BLOCK__\n", "__GPU_LOAD_BLOCK__"
-                    ).trim();
-                    String[] gpuFreqParts = gpuFreqBlock.split("\\s+");
-                    String gpuFreqPath = gpuFreqParts.length >= 2
-                            ? gpuFreqParts[1] : "";
-                    sample.gpuFreqMHz = parseGpuFrequencyMHz(
-                            gpuFreqBlock, gpuFreqPath);
-                    if (!gpuFreqPath.equals("none") && !gpuFreqPath.isEmpty()) {
-                        cachedGpuFreqPath = validateSysfsPath(gpuFreqPath);
-                    }
-
-                    String gpuLoadBlock = between(
-                            freqOutput, "__GPU_LOAD_BLOCK__\n", "__THERMAL_BLOCK__").trim();
-                    String selectedGpuLoad = firstValidGpuLoadCandidate(gpuLoadBlock);
-
-                    sample.gpuLoadPercent = -1;
-                    cachedGpuLoadPath = "";
-
-                    if (!selectedGpuLoad.isEmpty()) {
-                        String[] gpuLoadParts = selectedGpuLoad.split("\\s+");
-                        String gpuLoadPath = gpuLoadParts[gpuLoadParts.length - 1];
-                        String validatedPath = validateSysfsPath(gpuLoadPath);
-                        if (!validatedPath.isEmpty()) {
-                            sample.gpuLoadPercent = parseGpuLoadPercent(selectedGpuLoad);
-                            cachedGpuLoadPath = validatedPath;
-                        }
-                    }
-
-                    parseThermalTemperatures(
-                            between(freqOutput, "__THERMAL_BLOCK__\n", "__COOLING_BLOCK__"), sample);
-                    applyCoolingReading(
-                            between(freqOutput, "__COOLING_BLOCK__\n", "__MALI_BLOCK__"), sample);
-
-                    String maliBlock = between(freqOutput, "__MALI_BLOCK__\n", "__END__").trim();
-                    if (!maliBlock.isEmpty()) {
-                        cachedMaliPath = maliBlock.equals("none")
-                                ? ""
-                                : validateSysfsPath(maliBlock);
-                    }
-                    maliSearchCompleted = true;
+                    applySysfsMetrics(freqOutput, sample);
                 }
             } catch (Exception ignored) {
                 // Keep metrics unavailable if the command fails
             }
+            long tMetrics = android.os.SystemClock.elapsedRealtime();
 
-            // Foreground package refresh
-            long foregroundRefreshMs = recording ? 500 : 1000;
-            if (cachedForegroundPackage.isEmpty() || now - lastForegroundCheckMs >= foregroundRefreshMs) {
-                String foregroundOutput = service.getResumedActivityDump();
-                if (foregroundOutput == null) foregroundOutput = "";
-
-                java.util.regex.Pattern componentPattern =
-                        java.util.regex.Pattern.compile(
-                                "([A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+)/" +
-                                        "[A-Za-z0-9_.$]+"
-                        );
-                java.util.regex.Matcher foregroundMatcher =
-                        componentPattern.matcher(foregroundOutput);
-                String foundPackage = foregroundMatcher.find() ? foregroundMatcher.group(1) : "";
-
-                if (foundPackage.isEmpty()) {
-                    String windowOutput = service.getWindowDump();
-                    if (windowOutput != null) {
-                        java.util.regex.Matcher windowMatcher =
-                                componentPattern.matcher(windowOutput);
-                        if (windowMatcher.find()) foundPackage = windowMatcher.group(1);
-                    }
+            // Foreground package: normally kept fresh by the FPS loop, so the
+            // sampling thread does not pay a dumpsys round trip (~46 ms). Only
+            // look it up here on the first sample, or if the cache went stale.
+            shizukuFgRefreshMs = recording ? 1000 : 1500;
+            if (cachedForegroundPackage.isEmpty()
+                    || now - lastForegroundCheckMs >= 5000) {
+                String foundPackage = lookupForegroundShizuku(service);
+                if (!foundPackage.isEmpty()) {
+                    cachedForegroundPackage = foundPackage;
+                    lastForegroundCheckMs = now;
                 }
-                cachedForegroundPackage = foundPackage;
-                lastForegroundCheckMs = now;
             }
+
+            long tFg = android.os.SystemClock.elapsedRealtime();
+            recordShizukuPerf(tStart, tMetrics, tFg);
+
 
             String foregroundPackage = cachedForegroundPackage;
             if (foregroundPackage.isEmpty()) {
@@ -735,33 +867,157 @@ final class MonitoringEngine {
         }
     }
 
+    private static final String ROOT_FOREGROUND_SCRIPT =
+            "dumpsys window 2>/dev/null | grep -m 1 'mCurrentFocus=Window'"
+                    + " | sed 's/.* u[0-9]* //; s#/.*##'";
+
+    /**
+     * Normally just returns the package kept fresh by the background loop, so the
+     * sampling thread never waits on dumpsys. It only does the lookup itself for
+     * the very first sample, or if the loop has not refreshed it for a while.
+     */
     private String getForegroundAppRoot() {
         long now = android.os.SystemClock.elapsedRealtime();
+        String cached = cachedForegroundPackage;
 
-        // Reuse the last answer for 1.5 s. The foreground app rarely changes,
-        // and running dumpsys window on every sample is what made the display
-        // refresh only once per second.
-        if (!cachedForegroundPackage.isEmpty()
-                && now - lastForegroundCheckMs < 1500) {
-            return cachedForegroundPackage;
+        if (!cached.isEmpty() && now - lastForegroundCheckMs < 5000) {
+            return cached;
         }
 
-        String script = "dumpsys window 2>/dev/null | grep -m 1 'mCurrentFocus=Window'"
-                + " | sed 's/.* u[0-9]* //; s#/.*##'";
-        String out = rootCommand(script);
+        refreshForegroundRoot(mainRootShell);
 
+        cached = cachedForegroundPackage;
+        // Keep the last known app rather than flashing "Unknown".
+        return cached.isEmpty() ? "Unknown" : cached;
+    }
+
+    private void refreshForegroundRootIfDue(RootShell sh) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (cachedForegroundPackage.isEmpty()
+                || now - lastForegroundCheckMs >= rootFgRefreshMs) {
+            refreshForegroundRoot(sh);
+            String pkg = cachedForegroundPackage;
+            if (!pkg.isEmpty()) fpsPackage = pkg;
+        }
+    }
+
+    private void refreshForegroundRoot(RootShell sh) {
+        String out = sh.exec(ROOT_FOREGROUND_SCRIPT);
         if (out != null) {
             String app = out.trim();
             if (!app.isEmpty()) {
                 cachedForegroundPackage = app;
-                lastForegroundCheckMs = now;
-                return app;
+                lastForegroundCheckMs = android.os.SystemClock.elapsedRealtime();
             }
         }
-
-        // Keep the last known app rather than flashing "Unknown".
-        return cachedForegroundPackage.isEmpty() ? "Unknown" : cachedForegroundPackage;
     }
+
+    private void refreshForegroundShizukuIfDue(IOnyxUserService service) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (cachedForegroundPackage.isEmpty()
+                || now - lastForegroundCheckMs >= shizukuFgRefreshMs) {
+            String pkg = lookupForegroundShizuku(service);
+            if (!pkg.isEmpty()) {
+                cachedForegroundPackage = pkg;
+                lastForegroundCheckMs = now;
+                fpsPackage = pkg;
+            }
+        }
+    }
+
+    /** One dumpsys round trip: resumed activity, then window focus as fallback. */
+    private String lookupForegroundShizuku(IOnyxUserService service) {
+        try {
+            String foregroundOutput = service.getResumedActivityDump();
+            if (foregroundOutput == null) foregroundOutput = "";
+
+            java.util.regex.Matcher matcher =
+                    COMPONENT_PATTERN.matcher(foregroundOutput);
+            String found = matcher.find() ? matcher.group(1) : "";
+
+            if (found.isEmpty()) {
+                String windowOutput = service.getWindowDump();
+                if (windowOutput != null) {
+                    java.util.regex.Matcher windowMatcher =
+                            COMPONENT_PATTERN.matcher(windowOutput);
+                    if (windowMatcher.find()) found = windowMatcher.group(1);
+                }
+            }
+            return found;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+
+    /**
+     * FPS is produced by the background OnyxFpsLoop (own su shell); the sampling
+     * thread only reads the latest result and drains the new frame intervals
+     * exactly once, like the Shizuku path.
+     */
+    private void applyCachedRootFps(Sample sample) {
+        if ("Unknown".equals(sample.app)) {
+            fpsPackage = "";
+            fpsDetector.reset();
+            latestFps = null;
+        } else {
+            fpsPackage = sample.app;
+            ensureFpsLoop();
+        }
+        FpsDetector.Result r = getLatestFps();
+
+        if (r != null && r.valid()) {
+            sample.fps = r.fps;
+            sample.fpsSource = r.source;
+            sample.averageFrameTimeMs = r.averageFrameTimeMs;
+            sample.frameTimeStdDevMs = r.frameTimeStdDevMs;
+            sample.stutterCount = r.stutterCount;
+            sample.frameRefreshPeriodMs = r.frameRefreshPeriodMs;
+            sample.frameIntervalsMs.addAll(drainIntervals());
+        } else {
+            sample.fps = -1;
+            sample.fpsSource = "none";
+            sample.averageFrameTimeMs = -1;
+            sample.frameTimeStdDevMs = -1;
+            sample.stutterCount = -1;
+        }
+    }
+
+    private void recordRootPerf(long tStart, long tFg, long tMetrics, boolean viaHelper) {
+        long end = android.os.SystemClock.elapsedRealtime();
+        perfFgMs += tFg - tStart;
+        perfMetricsMs += tMetrics - tFg;
+        perfTotalMs += end - tStart;
+        if (++perfCount >= 20) {
+            android.util.Log.d("OnyxRootPerf", (viaHelper ? "[helper] " : "[script] ")
+                    + "avg over " + perfCount
+                    + " samples: foreground=" + (perfFgMs / perfCount)
+                    + "ms metrics=" + (perfMetricsMs / perfCount)
+                    + "ms total=" + (perfTotalMs / perfCount) + "ms");
+            perfCount = 0;
+            perfFgMs = 0;
+            perfMetricsMs = 0;
+            perfTotalMs = 0;
+        }
+    }
+
+    private void recordShizukuPerf(long tStart, long tMetrics, long tFg) {
+        long end = android.os.SystemClock.elapsedRealtime();
+        szPerfMetricsMs += tMetrics - tStart;
+        szPerfFgMs += tFg - tMetrics;
+        szPerfTotalMs += end - tStart;
+        if (++szPerfCount >= 20) {
+            android.util.Log.d("OnyxShizukuPerf", "avg over " + szPerfCount
+                    + " samples: metrics=" + (szPerfMetricsMs / szPerfCount)
+                    + "ms foreground=" + (szPerfFgMs / szPerfCount)
+                    + "ms total=" + (szPerfTotalMs / szPerfCount) + "ms");
+            szPerfCount = 0;
+            szPerfMetricsMs = 0;
+            szPerfFgMs = 0;
+            szPerfTotalMs = 0;
+        }
+    }
+
 
     private double[] parseCpu(String raw) {
         return cpuUsageTracker.parse(raw);
@@ -1045,34 +1301,34 @@ final class MonitoringEngine {
         return y < 0 ? "" : value.substring(x, y);
     }
 
-    private FpsDetector.Shell rootFpsShell() {
+    private FpsDetector.Shell rootFpsShell(final RootShell sh) {
         return new FpsDetector.Shell() {
             @Override public String surfaceFlingerDump() {
-                String out = rootCommand("dumpsys SurfaceFlinger 2>/dev/null");
+                String out = sh.exec("dumpsys SurfaceFlinger 2>/dev/null");
                 return out == null ? "" : out;
             }
             @Override public String surfaceFlingerLayers() {
-                String out = rootCommand("dumpsys SurfaceFlinger --list 2>/dev/null");
+                String out = sh.exec("dumpsys SurfaceFlinger --list 2>/dev/null | grep -i SurfaceView");
                 return out == null ? "" : out;
             }
             @Override public String surfaceFlingerLatency(String layerName) {
-                String out = rootCommand("dumpsys SurfaceFlinger --latency " + shellQuote(layerName));
+                String out = sh.exec("dumpsys SurfaceFlinger --latency " + shellQuote(layerName));
                 return out == null ? "" : out;
             }
             @Override public String surfaceFlingerLayerLatencySnapshot(
                     String packageName, boolean blastOnly) {
-                String out = rootCommand(
+                String out = sh.exec(
                         FpsDetector.buildSurfaceFlingerLayerLatencyScript(
                                 packageName, blastOnly));
                 return out == null ? "" : out;
             }
             @Override public String surfaceFlingerTimeStatsDump() {
-                String out = rootCommand(
+                String out = sh.exec(
                         "dumpsys SurfaceFlinger --timestats -maxlayers 64 -dump 2>/dev/null");
                 return out == null ? "" : out;
             }
             @Override public String surfaceFlingerTimeStatsSnapshot() {
-                String out = rootCommand(
+                String out = sh.exec(
                         "echo __ONYX_LAYERS__; " +
                                 "dumpsys SurfaceFlinger --list 2>/dev/null; " +
                                 "echo __ONYX_TIMESTATS__; " +
@@ -1128,155 +1384,195 @@ final class MonitoringEngine {
     private static final long ROOT_COMMAND_TIMEOUT_MS = 8_000;
     private static final String ROOT_SHELL_EOF = "__ONYX_ROOT_SHELL_EOF__";
 
-    private final Object rootShellLock = new Object();
-    private Process rootShellProcess;
-    private java.io.BufferedWriter rootShellWriter;
-    private java.util.concurrent.BlockingQueue<String> rootShellLines;
-    private Thread rootShellReader;
-    private long rootShellCommandId;
+    // Two independent su shells so slow FPS dumpsys calls never block the
+    // metrics read (and vice versa).
+    private final RootShell mainRootShell = new RootShell("OnyxRootShellReader");
+    private final RootShell fpsRootShell = new RootShell("OnyxRootFpsShellReader");
 
-    /**
-     * Reuses one authorized su shell for successive sampling commands.
-     * Unique end markers keep each command's output isolated.
-     */
     private String rootCommand(String command) {
-        if (command == null || command.isEmpty()) return null;
-
-        synchronized (rootShellLock) {
-            try {
-                ensureRootShellLocked();
-
-                long commandId = ++rootShellCommandId;
-                String marker = "__ONYX_ROOT_DONE_" + commandId + "__";
-                rootShellWriter.write(command);
-                rootShellWriter.newLine();
-                rootShellWriter.write("printf '\\n%s\\n' '" + marker + "'");
-                rootShellWriter.newLine();
-                rootShellWriter.flush();
-
-                StringBuilder output = new StringBuilder();
-                long deadline = android.os.SystemClock.elapsedRealtime()
-                        + ROOT_COMMAND_TIMEOUT_MS;
-                boolean outputLimitReached = false;
-
-                while (true) {
-                    long remaining = deadline
-                            - android.os.SystemClock.elapsedRealtime();
-                    if (remaining <= 0) {
-                        throw new java.util.concurrent.TimeoutException(
-                                "Root command timed out");
-                    }
-
-                    String line = rootShellLines.poll(
-                            remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (line == null) {
-                        throw new java.util.concurrent.TimeoutException(
-                                "Root shell stopped responding");
-                    }
-                    if (ROOT_SHELL_EOF.equals(line)) {
-                        throw new java.io.IOException("Root shell exited");
-                    }
-                    if (marker.equals(line)) {
-                        if (outputLimitReached) {
-                            return null;
-                        }
-                        return output.toString();
-                    }
-
-                    if (!outputLimitReached) {
-                        int needed = line.length() + 1;
-                        if (output.length() + needed > ROOT_OUTPUT_LIMIT) {
-                            outputLimitReached = true;
-                        } else {
-                            output.append(line).append('\n');
-                        }
-                    }
-                }
-            } catch (Exception ignored) {
-                destroyRootShellLocked();
-                return null;
-            }
-        }
-    }
-
-    private void ensureRootShellLocked() throws Exception {
-        if (rootShellProcess != null && rootShellWriter != null
-                && rootShellLines != null && rootShellReader != null
-                && rootShellReader.isAlive()) {
-            return;
-        }
-
-        destroyRootShellLocked();
-        Process process = new ProcessBuilder("su")
-                .redirectErrorStream(true)
-                .start();
-        java.util.concurrent.BlockingQueue<String> lines =
-                new java.util.concurrent.ArrayBlockingQueue<>(8192);
-        java.io.BufferedReader reader = new java.io.BufferedReader(
-                new InputStreamReader(process.getInputStream(),
-                        StandardCharsets.UTF_8));
-
-        Thread readerThread = new Thread(() -> {
-            try {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    lines.put(line);
-                }
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            } catch (Exception ignored) {
-            } finally {
-                lines.offer(ROOT_SHELL_EOF);
-            }
-        }, "OnyxRootShellReader");
-        readerThread.setDaemon(true);
-        readerThread.start();
-
-        rootShellProcess = process;
-        rootShellWriter = new java.io.BufferedWriter(
-                new java.io.OutputStreamWriter(
-                        process.getOutputStream(), StandardCharsets.UTF_8));
-        rootShellLines = lines;
-        rootShellReader = readerThread;
+        return mainRootShell.exec(command);
     }
 
     void closeRootShell() {
-        synchronized (rootShellLock) {
-            destroyRootShellLocked();
-        }
+        mainRootShell.close();
+        fpsRootShell.close();
+        closeRootHelper();
     }
 
-    private void destroyRootShellLocked() {
-        if (rootShellWriter != null) {
-            try {
-                rootShellWriter.write("exit");
-                rootShellWriter.newLine();
-                rootShellWriter.flush();
-            } catch (Exception ignored) {
-            }
-            try {
-                rootShellWriter.close();
-            } catch (Exception ignored) {
-            }
+    /**
+     * One reusable authorized su shell for successive commands.
+     * Unique end markers keep each command's output isolated.
+     */
+    private static final class RootShell {
+        private final String readerName;
+        private final Object lock = new Object();
+        private Process process;
+        private java.io.BufferedWriter writer;
+        private java.util.concurrent.BlockingQueue<String> lines;
+        private Thread reader;
+        private long commandId;
+
+        private final String[] launchCommand;   // null = plain interactive "su"
+        private final long timeoutMs;
+
+        RootShell(String readerName) {
+            this(readerName, null, ROOT_COMMAND_TIMEOUT_MS);
         }
-        if (rootShellProcess != null) {
-            try {
-                rootShellProcess.destroy();
-                if (!rootShellProcess.waitFor(
-                        500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                    rootShellProcess.destroyForcibly();
+
+        RootShell(String readerName, String[] launchCommand, long timeoutMs) {
+            this.readerName = readerName;
+            this.launchCommand = launchCommand;
+            this.timeoutMs = timeoutMs;
+        }
+
+        String exec(String command) {
+            if (command == null || command.isEmpty()) return null;
+
+            synchronized (lock) {
+                try {
+                    ensureLocked();
+
+                    long id = ++commandId;
+                    String marker;
+                    if (launchCommand != null) {
+                        // Helper protocol: one request line, reply ends with its own marker.
+                        marker = RootMetricsHelper.END_MARKER;
+                        writer.write(command);
+                        writer.newLine();
+                    } else {
+                        marker = "__ONYX_ROOT_DONE_" + id + "__";
+                        writer.write(command);
+                        writer.newLine();
+                        writer.write("printf '\\n%s\\n' '" + marker + "'");
+                        writer.newLine();
+                    }
+                    writer.flush();
+
+                    StringBuilder output = new StringBuilder();
+                    long deadline = android.os.SystemClock.elapsedRealtime()
+                            + timeoutMs;
+                    boolean outputLimitReached = false;
+
+                    while (true) {
+                        long remaining = deadline
+                                - android.os.SystemClock.elapsedRealtime();
+                        if (remaining <= 0) {
+                            throw new java.util.concurrent.TimeoutException(
+                                    "Root command timed out");
+                        }
+
+                        String line = lines.poll(
+                                remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (line == null) {
+                            throw new java.util.concurrent.TimeoutException(
+                                    "Root shell stopped responding");
+                        }
+                        if (ROOT_SHELL_EOF.equals(line)) {
+                            throw new java.io.IOException("Root shell exited");
+                        }
+                        if (marker.equals(line)) {
+                            if (outputLimitReached) {
+                                return null;
+                            }
+                            return output.toString();
+                        }
+
+                        if (!outputLimitReached) {
+                            int needed = line.length() + 1;
+                            if (output.length() + needed > ROOT_OUTPUT_LIMIT) {
+                                outputLimitReached = true;
+                            } else {
+                                output.append(line).append('\n');
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                    destroyLocked();
+                    return null;
                 }
-            } catch (Exception ignored) {
-                rootShellProcess.destroyForcibly();
             }
         }
-        if (rootShellReader != null) {
-            rootShellReader.interrupt();
+
+        void close() {
+            synchronized (lock) {
+                destroyLocked();
+            }
         }
-        rootShellProcess = null;
-        rootShellWriter = null;
-        rootShellLines = null;
-        rootShellReader = null;
+
+        private void ensureLocked() throws Exception {
+            if (process != null && writer != null
+                    && lines != null && reader != null
+                    && reader.isAlive()) {
+                return;
+            }
+
+            destroyLocked();
+            Process p = new ProcessBuilder(
+                    launchCommand != null ? launchCommand : new String[]{"su"})
+                    .redirectErrorStream(true)
+                    .start();
+            final java.util.concurrent.BlockingQueue<String> q =
+                    new java.util.concurrent.ArrayBlockingQueue<>(8192);
+            final java.io.BufferedReader r = new java.io.BufferedReader(
+                    new InputStreamReader(p.getInputStream(),
+                            StandardCharsets.UTF_8));
+
+            Thread readerThread = new Thread(() -> {
+                try {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        q.put(line);
+                    }
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception ignored) {
+                } finally {
+                    q.offer(ROOT_SHELL_EOF);
+                }
+            }, readerName);
+            readerThread.setDaemon(true);
+            readerThread.start();
+
+            process = p;
+            writer = new java.io.BufferedWriter(
+                    new java.io.OutputStreamWriter(
+                            p.getOutputStream(), StandardCharsets.UTF_8));
+            lines = q;
+            reader = readerThread;
+        }
+
+        private void destroyLocked() {
+            if (writer != null) {
+                try {
+                    writer.write("exit");
+                    writer.newLine();
+                    writer.flush();
+                } catch (Exception ignored) {
+                }
+                try {
+                    writer.close();
+                } catch (Exception ignored) {
+                }
+            }
+            if (process != null) {
+                try {
+                    process.destroy();
+                    if (!process.waitFor(
+                            500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        process.destroyForcibly();
+                    }
+                } catch (Exception ignored) {
+                    process.destroyForcibly();
+                }
+            }
+            if (reader != null) {
+                reader.interrupt();
+            }
+            process = null;
+            writer = null;
+            lines = null;
+            reader = null;
+        }
     }
 
     private boolean checkRootAccess() {

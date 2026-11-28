@@ -6,7 +6,6 @@ import java.io.FileInputStream;
 import java.io.FileReader;
 
 import android.os.RemoteException;
-import android.os.SystemClock;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -349,16 +348,7 @@ public class ShizukuShellService extends IOnyxUserService.Stub {
 
     @Override
     public String getSurfaceFlingerDump() throws RemoteException {
-        long start = SystemClock.elapsedRealtime();
-
-        String result = run(new String[]{"dumpsys", "SurfaceFlinger"});
-
-        android.util.Log.d("ONYX_SF_DUMP",
-                "duration=" + (SystemClock.elapsedRealtime() - start)
-                        + "ms, outputLength="
-                        + (result == null ? 0 : result.length()));
-
-        return result;
+        return run(new String[]{"dumpsys", "SurfaceFlinger"});
     }
 
     @Override
@@ -442,15 +432,7 @@ public class ShizukuShellService extends IOnyxUserService.Stub {
     }
 
     private static String run(String[] command, long timeoutSeconds, int maxOutputChars) {
-
-        long t0 = SystemClock.elapsedRealtime();
-        String r = runInner(command, timeoutSeconds, maxOutputChars);
-        long took = SystemClock.elapsedRealtime() - t0;
-
-        String label = command[command.length - 1].length() > 60
-                ? command[0] + " <script>"
-                : String.join(" ", command);
-        return r;
+        return runInner(command, timeoutSeconds, maxOutputChars);
     }
 
     private static String runInner(String[] command, long timeoutSeconds, int maxOutputChars) {

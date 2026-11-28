@@ -15,36 +15,18 @@ final class SamplingController {
         public void run() {
             if (busy) return;
             busy = true;
-            final long schedulerStartMs =
-                    android.os.SystemClock.elapsedRealtime();
-
-            android.util.Log.d("ONYX_SCHED",
-                    "handlerStart=" + schedulerStartMs);
 
             final int currentSessionId = activity.sessionId;
             final boolean recording = activity.running
                     && !activity.isOverlaySession();
 
             activity.worker.execute(() -> {
-                final long workerStartMs =
-                        android.os.SystemClock.elapsedRealtime();
-
-                android.util.Log.d("ONYX_SCHED",
-                        "workerStart=" + workerStartMs
-                                + ", queueDelay=" + (workerStartMs - schedulerStartMs) + "ms");
                 String detected = "ANDROID";
                 Sample taken = null;
                 final long sampleStartMs = android.os.SystemClock.elapsedRealtime();
 
                 try {
                     taken = activity.monitoringEngine.sample(recording);
-                    long sampleDurationMs =
-                            android.os.SystemClock.elapsedRealtime() - sampleStartMs;
-
-                    android.util.Log.d("ONYX_SAMPLE",
-                            "duration=" + sampleDurationMs
-                                    + "ms, fps=" + (taken != null ? taken.fps : -1)
-                                    + ", source=" + (taken != null ? taken.fpsSource : "none"));
                     detected = activity.monitoringEngine.getMonitoringMode();
                     activity.cachedMonitoringMode = detected;
 
@@ -61,11 +43,6 @@ final class SamplingController {
                     }
                 } catch (Throwable error) {
                     android.util.Log.e("ONYX_SAMPLE", "sample failed", error);
-                } finally {
-                    android.util.Log.d("ONYX_SAMPLE",
-                            "totalDuration=" +
-                                    (android.os.SystemClock.elapsedRealtime() - sampleStartMs)
-                                    + "ms");
                 }
 
                 final String mode = detected;
@@ -73,12 +50,6 @@ final class SamplingController {
 
                 activity.runOnUiThread(() -> {
                     busy = false;
-                    final long uiStartMs =
-                            android.os.SystemClock.elapsedRealtime();
-
-                    android.util.Log.d("ONYX_SCHED",
-                            "uiStart=" + uiStartMs
-                                    + ", callbackDelay=" + (uiStartMs - workerStartMs) + "ms");
 
                     if (currentSessionId != activity.sessionId) {
                         scheduleAt(sampleStartMs + 500L);
@@ -134,10 +105,6 @@ final class SamplingController {
                         }
                     }
 
-                    android.util.Log.d("ONYX_SCHED",
-                            "uiWork=" +
-                                    (android.os.SystemClock.elapsedRealtime() - uiStartMs) + "ms");
-
                     scheduleAt(sampleStartMs + 500L);
                 });
             });
@@ -149,7 +116,10 @@ final class SamplingController {
     }
 
     private boolean isNeeded() {
-        return (activity.isAppForeground && activity.selectedTab == 0)
+        // The overlay is fed by this sampler while the app is in the foreground
+        // (the service engine is stopped), so it must keep running on every tab.
+        return (activity.isAppForeground
+                && (activity.selectedTab == 0 || activity.isOverlayEnabled()))
                 || (activity.running && !activity.isOverlaySession());
     }
 
